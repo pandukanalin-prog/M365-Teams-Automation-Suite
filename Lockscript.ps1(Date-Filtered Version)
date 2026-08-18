@@ -1,0 +1,104 @@
+# 1. Clear any broken or expired sessions first
+Disconnect-PnPOnline -ErrorAction SilentlyContinue
+
+# 2. Using Custom App
+$MyCustomClientId = "YOUR-CLIENT-ID-HERE"
+$RootUrl = "https://yourdomain.sharepoint.com"
+
+# ---> 3. SET YOUR STRICT CUTOFF DATE HERE (YYYY-MM-DD format) <---
+$CutoffDate = Get-Date "2026-08-08" 
+
+Write-Host "Connecting using Custom App..." -ForegroundColor Cyan
+Connect-PnPOnline -Url $RootUrl -Interactive -ClientId $MyCustomClientId
+
+# 4. Get the exact Admin email address automatically for self-healing
+$MyAccount = Invoke-PnPGraphMethod -Method Get -Url "v1.0/me"
+$MyEmail = $MyAccount.userPrincipalName
+Write-Host "Logged in as Admin: $MyEmail" -ForegroundColor Magenta
+
+# 5. Fetch the master list via Graph
+Write-Host "Downloading master list of classes..." -ForegroundColor Yellow
+$AllClasses = Get-PnPMicrosoft365Group
+
+if ($AllClasses.Count -gt 0) {
+    
+    $MasterToken = Get-PnPAccessToken -ResourceTypeName SharePoint
+    Write-Host "Starting the FAST lockdown loop..." -ForegroundColor Green
+
+    foreach ($Class in $AllClasses) {
+        
+        # ====================================================
+        # THE STRICT DATE FILTER (Skips old classes instantly)
+        # ====================================================
+        if ($Class.CreatedDateTime -lt $CutoffDate) {
+            Write-Host "Skipped: $($Class.DisplayName) (Too Old)" -ForegroundColor DarkGray
+            continue # This instantly skips to the next class without scanning!
+        }
+        
+        Write-Host "-------------------------------------------" -ForegroundColor DarkGray
+        Write-Host "Processing NEW Class: $($Class.DisplayName)" -ForegroundColor Cyan
+        
+        $SiteUrl = $Class.SiteUrl
+        if (-not $SiteUrl) { $SiteUrl = "$RootUrl/sites/$($Class.MailNickname)" }
+        if (-not $SiteUrl -or $SiteUrl -eq "$RootUrl/sites/") { continue }
+        
+        try {
+            Connect-PnPOnline -Url $SiteUrl -AccessToken $MasterToken
+            $MembersGroup = Get-PnPGroup -AssociatedMemberGroup
+            
+            $List = Get-PnPList -Identity "Documents" -Includes HasUniqueRoleAssignments
+            
+            # Check if it's already restricted so we don't do it twice
+            $IsRestricted = $false
+            if ($List.HasUniqueRoleAssignments -eq $true) {
+                $CurrentPerms = Get-PnPListPermissions -Identity "Documents" -PrincipalId $MembersGroup.Id
+                if (($CurrentPerms.Name -contains "Read") -and ($CurrentPerms.Name -notcontains "Edit")) {
+                    $IsRestricted = $true
+                }
+            }
+
+            if ($IsRestricted -eq $true) {
+                Write-Host "  -> Skipped: The Members group is already restricted." -ForegroundColor DarkGray
+            } else {
+                Write-Host "  -> Locking down the master library..." -ForegroundColor Yellow
+                
+                if ($List.HasUniqueRoleAssignments -eq $false) {
+                    Set-PnPList -Identity "Documents" -BreakRoleInheritance -CopyRoleAssignments
+                }
+                
+                Set-PnPListPermission -Identity "Documents" -Group $MembersGroup.Title -RemoveRole "Edit"
+                Set-PnPListPermission -Identity "Documents" -Group $MembersGroup.Title -AddRole "Read"
+                
+                Write-Host "  -> Success! Entire class locked down." -ForegroundColor Green
+            }
+        }
+        catch {
+            # THE SELF-HEALING BLOCK (If Access is Denied on a new private class)
+            if ($_.Exception.Message -match "Unauthorized") {
+                Write-Host "  -> Access Denied (Private Class). Injecting Admin permissions..." -ForegroundColor Yellow
+                
+                try {
+                    Add-PnPMicrosoft365GroupOwner -Identity $Class.Id -Users $MyEmail
+                    Write-Host "  -> Waiting 10 seconds for Microsoft cloud to sync permissions..." -ForegroundColor DarkGray
+                    Start-Sleep -Seconds 10
+                    
+                    Connect-PnPOnline -Url $SiteUrl -AccessToken $MasterToken
+                    $MembersGroup = Get-PnPGroup -AssociatedMemberGroup
+                    
+                    $List = Get-PnPList -Identity "Documents" -Includes HasUniqueRoleAssignments
+                    if ($List.HasUniqueRoleAssignments -eq $false) { Set-PnPList -Identity "Documents" -BreakRoleInheritance -CopyRoleAssignments }
+                    Set-PnPListPermission -Identity "Documents" -Group $MembersGroup.Title -RemoveRole "Edit"
+                    Set-PnPListPermission -Identity "Documents" -Group $MembersGroup.Title -AddRole "Read"
+                    Write-Host "  -> Success! Block bypassed and class locked." -ForegroundColor Green
+                    
+                } catch { Write-Host "  -> Failed to force access. Error: $_" -ForegroundColor Red }
+            } else { Write-Host "  -> Failed to process site. Error: $_" -ForegroundColor Red }
+        }
+    }
+    
+    Write-Host "All new classes have been processed! Disconnecting securely." -ForegroundColor Cyan
+    Disconnect-PnPOnline
+
+} else {
+    Write-Host "Error: 0 groups returned." -ForegroundColor Red
+}
